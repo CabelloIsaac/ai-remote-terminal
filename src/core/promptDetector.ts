@@ -105,6 +105,77 @@ export function stripAnsi(text: string): string {
     .trim();
 }
 
+// ── Claude Code UI character classes ──
+
+// Spinner / decoration Unicode chars used by Claude Code's TUI
+const SPINNER_CHARS =
+  /[✳✢✶✻✽⏺◐◑◒◓⠋⠙⠹⠸⠼⠴⠦⠧⠇⠏⣾⣽⣻⢿⡿⣟⣯⣷●○◉◎⬤⬡⬢⬣⭘⏻⏼⏽⏾▪▫◽◾◻◼⊙⊚⦿⦾⧫⧬]/g;
+
+// Box-drawing and decorative line characters
+const BOX_DRAWING =
+  /[─━│┃┄┅┆┇┈┉┊┋┌┍┎┏┐┑┒┓└┕┖┗┘┙┚┛├┝┞┟┠┡┢┣┤┥┦┧┨┩┪┫┬┭┮┯┰┱┲┳┴┵┶┷┸┹┺┻┼┽┾┿╀╁╂╃╄╅╆╇╈╉╊╋╌╍╎╏═║╒╓╔╕╖╗╘╙╚╛╜╝╞╟╠╡╢╣╤╥╦╧╨╩╪╫╬╭╮╯╰╱╲╳╴╵╶╷╸╹╺╻╼╽╾╿]/g;
+
+// Lines that are purely decorative (only box-drawing, dashes, spaces)
+const DECORATIVE_LINE_RE = /^[\s─━═╌╍┄┅\-~_⎯⏤·•…⧉]*$/;
+
+// Claude Code UI lines to discard entirely
+const UI_LINE_PATTERNS: RegExp[] = [
+  DECORATIVE_LINE_RE,
+  /^❯\s*$/,                          // empty prompt
+  /^❯\s*Try\s/,                      // suggestion prompt (❯ Try "...")
+  /⧉\s*In\s/,                        // status bar (⧉ In .env)
+  /^\s*Tip:/i,                        // tip lines
+  /^\s*⎿\s*Tip:/i,                   // indented tip with connector
+  /^\s*⎿\s*$/,                       // bare connector
+  /^\s*\.\.\.\s*$/,                   // bare ellipsis
+  /^\s*[⎿⎾⎿⏐│|]\s*$/,               // vertical connectors alone
+  /^Create skills by adding/,         // skill creation tip
+  /^\.md files to \.claude/,          // continuation of skill tip
+  /^\s*>\s*$/,                        // bare > prompt
+];
+
+/**
+ * Clean raw PTY output for Telegram display.
+ * Strips ANSI codes, Unicode TUI decorations, and Claude Code UI chrome.
+ * Returns only meaningful content text.
+ */
+export function cleanForTelegram(rawData: string): string {
+  // 1. Strip ANSI escape sequences
+  let text = rawData
+    .replace(ANSI_RE, " ")
+    .replace(/\]8;;[^\x07]*\x07/g, " ")
+    .replace(/\]8;;[^\\]*\\\\/g, " ")
+    .replace(/[\x00-\x08\x0B\x0C\x0E-\x1F]/g, "");
+
+  // 2. Strip spinner / decoration Unicode
+  text = text.replace(SPINNER_CHARS, " ");
+
+  // 3. Strip box-drawing characters
+  text = text.replace(BOX_DRAWING, " ");
+
+  // 4. Filter lines: remove UI chrome, keep content
+  const lines = text.split("\n");
+  const kept: string[] = [];
+
+  for (let line of lines) {
+    // Collapse whitespace within the line
+    line = line.replace(/[ \t]+/g, " ").trim();
+
+    // Skip empty lines (will re-add paragraph breaks later)
+    if (!line) continue;
+
+    // Skip lines matching UI patterns
+    if (UI_LINE_PATTERNS.some((re) => re.test(line))) continue;
+
+    kept.push(line);
+  }
+
+  return kept
+    .join("\n")
+    .replace(/\n{3,}/g, "\n\n") // max 2 consecutive newlines
+    .trim();
+}
+
 /**
  * Checks a chunk of output for known interactive prompts.
  * Returns the first matched prompt or null.

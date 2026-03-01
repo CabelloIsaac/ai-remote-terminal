@@ -1,17 +1,20 @@
 import logger from "../utils/logger.js";
 import { ClaudeService } from "../services/claudeService.js";
 import { TelegramService } from "../services/telegramService.js";
-import type { DetectedPrompt } from "../core/promptDetector.js";
 
 /**
- * SessionManager wires ClaudeService ↔ TelegramService together.
- * Handles commands, routing, and lifecycle.
+ * SessionManager wires ClaudeService <-> TelegramService.
+ * Routes Telegram input to Claude and structured Claude events back to Telegram.
  */
 export class SessionManager {
   private claude: ClaudeService;
   private telegram: TelegramService;
-  private restartOnCrash = false;
-  private lastArgs: string[] = [];
+
+  // Text accumulation — Claude streams text in tiny chunks,
+  // we batch them before sending to Telegram.
+  private textBuffer = "";
+  private flushTimer: ReturnType<typeof setTimeout> | null = null;
+  private readonly FLUSH_DELAY_MS = 800;
 
   constructor(claude: ClaudeService, telegram: TelegramService) {
     this.claude = claude;
@@ -23,32 +26,25 @@ export class SessionManager {
     logger.info("SessionManager initialized");
   }
 
-  // ────────────────────────── Telegram → Claude ──────────────────────────
+  // ────────────────────────── Telegram -> Claude ──────────────────────────
 
   private bindTelegramHandlers(): void {
-    // Commands
     this.telegram.onCommand((command, args) => {
       switch (command) {
         case "start":
-          this.handleStart(args);
+          this.handleStart();
           break;
         case "stop":
           this.handleStop();
           break;
-        case "restart":
-          this.handleRestart();
+        case "new":
+          this.handleNew();
           break;
         case "status":
           this.handleStatus();
           break;
-        case "logs":
-          this.handleLogs(args);
-          break;
         case "interrupt":
           this.handleInterrupt();
-          break;
-        case "enter":
-          this.handleEnter();
           break;
         case "help":
           this.handleHelp();
@@ -60,175 +56,197 @@ export class SessionManager {
       }
     });
 
-    // Free-form text → Claude stdin
     this.telegram.onText((text) => {
       if (!this.claude.running) {
-        this.telegram.sendMessage(
-          "⚠️ Claude is not running. Use /start to begin a session.",
-        );
+        // Auto-start on first message
+        this.claude.start();
+        this.telegram.sendMessage("🟢 Session started.");
+      }
+      if (this.claude.busy) {
+        this.telegram.sendMessage("⏳ Still processing. Wait or /interrupt.");
         return;
       }
-      logger.info({ input: text }, "Forwarding user input to Claude");
-      this.claude.sendLine(text);
+      logger.info({ input: text }, "Forwarding to Claude");
+      this.claude.sendMessage(text);
     });
 
-    // Inline button callbacks
-    this.telegram.onCallback((action, queryId) => {
+    this.telegram.onCallback((action, _queryId) => {
       if (!this.claude.running) {
-        this.telegram.sendMessage("⚠️ Claude is not running.");
+        this.telegram.sendMessage("Claude is not running.");
         return;
       }
-
-      switch (action) {
-        case "approve":
-          logger.info("User approved prompt");
-          this.claude.approve();
-          this.telegram.sendMessage("✅ Approved");
-          break;
-        case "deny":
-          logger.info("User denied prompt");
-          this.claude.deny();
-          this.telegram.sendMessage("❌ Denied");
-          break;
-        case "enter":
-          logger.info("User pressed Enter via button");
-          this.claude.write("\n");
-          this.telegram.sendMessage("⏎ Enter sent");
-          break;
-        default:
-          // Generic callback — send as raw input
-          this.claude.sendLine(action);
+      // For now callbacks send as a new message to Claude
+      if (!this.claude.busy) {
+        this.claude.sendMessage(action);
       }
     });
   }
 
-  // ────────────────────────── Claude → Telegram ──────────────────────────
+  // ────────────────────────── Claude -> Telegram ──────────────────────────
 
   private bindClaudeHandlers(): void {
-    this.claude.on("output", (data: string) => {
-      this.telegram.pushOutput(data);
+    // Streamed text chunks — accumulate and flush periodically
+    this.claude.on("text", (chunk: string) => {
+      this.textBuffer += chunk;
+      this.scheduleFlush();
     });
 
-    this.claude.on("prompt", (prompt: DetectedPrompt) => {
-      if (prompt.type === "input") {
-        this.telegram.sendEnterPrompt(prompt.summary);
-      } else {
-        this.telegram.sendPrompt(prompt.summary);
-      }
-    });
-
+    // Tool invocations — show as compact notifications
     this.claude.on(
-      "exit",
-      (code: number | undefined, signal: number | undefined) => {
-        const msg = `🔴 Claude exited (code=${code ?? "?"}, signal=${signal ?? "?"})`;
-        this.telegram.sendMessage(msg);
+      "tool_use",
+      (info: { tool: string; input: Record<string, any> }) => {
+        this.flushText(); // send any pending text first
 
-        if (this.restartOnCrash && code !== 0) {
-          logger.info("Auto-restarting Claude after crash");
-          this.telegram.sendMessage("🔄 Auto-restarting…");
-          setTimeout(() => this.startClaude(this.lastArgs), 2000);
+        const detail = this.summarizeTool(info.tool, info.input);
+        this.telegram.sendMessage(`🔧 ${detail}`);
+      },
+    );
+
+    // Final result — flush remaining text, show cost
+    this.claude.on(
+      "result",
+      (r: {
+        text: string;
+        costUsd: number;
+        sessionId: string;
+        durationMs: number;
+      }) => {
+        this.flushText();
+
+        const parts: string[] = [];
+        if (r.costUsd > 0) parts.push(`$${r.costUsd.toFixed(4)}`);
+        if (r.durationMs > 0) parts.push(`${(r.durationMs / 1000).toFixed(1)}s`);
+        if (parts.length) {
+          this.telegram.sendMessage(`✅ Done (${parts.join(", ")})`);
         }
       },
     );
 
-    this.claude.on("error", (err: Error) => {
-      this.telegram.sendMessage(`❗ Error: ${err.message}`);
+    // Process exit
+    this.claude.on("done", (code: number) => {
+      this.flushText();
+      if (code !== 0 && code !== null) {
+        this.telegram.sendMessage(`⚠️ Claude exited with code ${code}`);
+      }
     });
+
+    // Errors
+    this.claude.on("error", (err: Error) => {
+      this.telegram.sendMessage(`❗ ${err.message}`);
+    });
+  }
+
+  // ── Text batching ──
+
+  private scheduleFlush(): void {
+    if (this.flushTimer) return;
+    this.flushTimer = setTimeout(() => {
+      this.flushText();
+    }, this.FLUSH_DELAY_MS);
+  }
+
+  private flushText(): void {
+    if (this.flushTimer) {
+      clearTimeout(this.flushTimer);
+      this.flushTimer = null;
+    }
+    const text = this.textBuffer.trim();
+    this.textBuffer = "";
+    if (text) {
+      this.telegram.sendMessage(text);
+    }
+  }
+
+  // ── Tool summary formatting ──
+
+  private summarizeTool(
+    tool: string,
+    input: Record<string, any>,
+  ): string {
+    const path =
+      input.file_path ?? input.path ?? input.pattern ?? input.query ?? "";
+    const cmd = input.command ?? "";
+
+    switch (tool) {
+      case "Read":
+        return `Read ${path}`;
+      case "Write":
+        return `Write ${path}`;
+      case "Edit":
+        return `Edit ${path}`;
+      case "Bash":
+        return `Bash: ${cmd.slice(0, 80)}${cmd.length > 80 ? "…" : ""}`;
+      case "Glob":
+        return `Glob ${path}`;
+      case "Grep":
+        return `Grep "${input.pattern ?? ""}" ${path}`;
+      case "WebSearch":
+        return `Search: ${input.query ?? ""}`;
+      case "WebFetch":
+        return `Fetch ${input.url ?? ""}`;
+      default:
+        return `${tool}${path ? ": " + path : ""}`;
+    }
   }
 
   // ────────────────────────── Command Handlers ──────────────────────────
 
-  private handleStart(args: string): void {
+  private handleStart(): void {
     if (this.claude.running) {
-      this.telegram.sendMessage(
-        "⚠️ Claude is already running. Use /stop first.",
-      );
+      this.telegram.sendMessage("Already running. Send a message or /new for fresh conversation.");
       return;
     }
-
-    const parsedArgs = args ? args.split(" ").filter(Boolean) : [];
-    this.startClaude(parsedArgs);
-  }
-
-  private startClaude(args: string[]): void {
-    try {
-      this.lastArgs = args;
-      this.claude.spawn(args);
-      this.telegram.sendMessage(
-        `🟢 Claude started${args.length ? ` with args: ${args.join(" ")}` : ""}`,
-      );
-    } catch (err: any) {
-      this.telegram.sendMessage(`❗ Failed to start Claude: ${err.message}`);
-    }
+    this.claude.start();
+    this.telegram.sendMessage("🟢 Ready. Send a message to begin.");
   }
 
   private handleStop(): void {
     if (!this.claude.running) {
-      this.telegram.sendMessage("ℹ️ Claude is not running.");
+      this.telegram.sendMessage("Not running.");
       return;
     }
     this.claude.stop();
-    this.telegram.sendMessage("🛑 Claude stopped.");
+    this.telegram.sendMessage("🔴 Stopped. Session ended.");
   }
 
-  private handleRestart(): void {
-    this.telegram.sendMessage("🔄 Restarting Claude…");
-    if (this.claude.running) {
-      this.claude.stop();
-    }
-    setTimeout(() => this.startClaude(this.lastArgs), 1000);
+  private handleNew(): void {
+    this.claude.newConversation();
+    if (!this.claude.running) this.claude.start();
+    this.telegram.sendMessage("🆕 New conversation. Send a message.");
   }
 
   private handleStatus(): void {
-    const status = this.claude.running ? "🟢 Running" : "🔴 Stopped";
-    this.telegram.sendMessage(`Status: ${status}`);
-  }
-
-  private handleLogs(args: string): void {
-    const n = Math.min(Number(args) || 50, 200);
-    const lines = this.claude.getLastLines(n);
-
-    if (lines.length === 0) {
-      this.telegram.sendMessage("No log output yet.");
-      return;
-    }
-
-    this.telegram.pushOutput(lines.join("\n"));
-  }
-
-  private handleEnter(): void {
     if (!this.claude.running) {
-      this.telegram.sendMessage("ℹ️ Claude is not running.");
-      return;
+      this.telegram.sendMessage("🔴 Stopped");
+    } else if (this.claude.busy) {
+      this.telegram.sendMessage("⏳ Processing...");
+    } else {
+      this.telegram.sendMessage("🟢 Ready");
     }
-    this.claude.write("\n");
-    this.telegram.sendMessage("⏎ Enter sent.");
   }
 
   private handleInterrupt(): void {
     if (!this.claude.running) {
-      this.telegram.sendMessage("ℹ️ Claude is not running.");
+      this.telegram.sendMessage("Not running.");
       return;
     }
     this.claude.interrupt();
-    this.telegram.sendMessage("⚡ Sent Ctrl+C to Claude.");
+    this.telegram.sendMessage("⚡ Interrupted.");
   }
 
   private handleHelp(): void {
     this.telegram.sendMessage(
       [
-        "🤖 *Claude Remote Bot*",
+        "🤖 Claude Remote",
         "",
-        "/start [args] — Start Claude session",
-        "/stop — Kill Claude process",
-        "/restart — Restart Claude",
-        "/status — Check if running",
-        "/logs [n] — Last n lines (default 50)",
-        "/enter — Send Enter keypress",
-        "/interrupt — Send Ctrl+C",
-        "/help — Show this message",
+        "/start — Start session",
+        "/stop — End session",
+        "/new — New conversation",
+        "/status — Check status",
+        "/interrupt — Cancel current task",
+        "/help — This message",
         "",
-        "Any other text is forwarded to Claude as input.",
+        "Just send text to chat with Claude.",
       ].join("\n"),
     );
   }
@@ -237,9 +255,7 @@ export class SessionManager {
 
   async shutdown(): Promise<void> {
     logger.info("Shutting down…");
-    if (this.claude.running) {
-      this.claude.stop();
-    }
+    this.claude.stop();
     await this.telegram.stop();
   }
 }

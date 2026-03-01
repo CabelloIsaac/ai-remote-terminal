@@ -25,10 +25,7 @@ if (!config.authorizedUserId || config.authorizedUserId === 0) {
 
 // ── Bootstrap ──
 
-logger.info(
-  { outputMode: config.outputMode, batchInterval: config.batchIntervalMs },
-  "Starting Claude Remote Bot",
-);
+logger.info("Starting Claude Remote Bot");
 
 const claude = new ClaudeService();
 const telegram = new TelegramService();

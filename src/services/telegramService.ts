@@ -4,7 +4,6 @@ import TelegramBot, {
 } from "node-telegram-bot-api";
 import logger from "../utils/logger.js";
 import { getConfig, type AppConfig } from "../utils/config.js";
-import { stripAnsi } from "../core/promptDetector.js";
 
 /** Maximum Telegram message length */
 const TG_MAX_LENGTH = 4096;
@@ -17,9 +16,7 @@ export class TelegramService {
   private config: AppConfig;
   private chatId: number | null = null;
 
-  // Batching state
-  private outputBuffer = "";
-  private batchTimer: ReturnType<typeof setInterval> | null = null;
+  // Rate-limiting
   private lastSendTime = 0;
   private sendQueue: Array<() => Promise<void>> = [];
   private processingQueue = false;
@@ -42,8 +39,6 @@ export class TelegramService {
     });
 
     this.setupHandlers();
-    this.startBatchTimer();
-
     logger.info("Telegram bot initialized");
   }
 
@@ -61,70 +56,12 @@ export class TelegramService {
     this.onCommandHandler = handler;
   }
 
-  /**
-   * Buffer output and send according to configured mode.
-   */
-  pushOutput(rawData: string): void {
-    const clean = stripAnsi(rawData);
-    if (!clean.trim()) return;
-
-    if (this.config.outputMode === "streaming") {
-      this.enqueueSend(() => this.sendCodeBlock(clean));
-    } else {
-      this.outputBuffer += clean;
-    }
-  }
-
-  /**
-   * Send a plain text message immediately (queued for rate-limit).
-   */
+  /** Send a plain text message (queued for rate-limit). */
   sendMessage(text: string): void {
     this.enqueueSend(() => this.rawSend(text));
   }
 
-  /**
-   * Send an interactive prompt message with Approve / Deny buttons.
-   */
-  sendPrompt(summary: string): void {
-    this.enqueueSend(async () => {
-      if (!this.chatId) return;
-      await this.bot.sendMessage(
-        this.chatId,
-        `⚠️ *Prompt Detected*\n\n${this.escapeMarkdown(summary)}`,
-        {
-          parse_mode: "MarkdownV2",
-          reply_markup: {
-            inline_keyboard: [
-              [
-                { text: "✅ Approve", callback_data: "approve" },
-                { text: "❌ Deny", callback_data: "deny" },
-              ],
-            ],
-          },
-        },
-      );
-    });
-  }
-
-  /**
-   * Send an "Enter to continue" prompt with a ⏎ button.
-   */
-  sendEnterPrompt(summary: string): void {
-    this.enqueueSend(async () => {
-      if (!this.chatId) return;
-      await this.bot.sendMessage(this.chatId, `⏎ ${summary}`, {
-        reply_markup: {
-          inline_keyboard: [
-            [{ text: "⏎ Press Enter", callback_data: "enter" }],
-          ],
-        },
-      });
-    });
-  }
-
-  /**
-   * Send an arbitrary message with custom inline keyboard.
-   */
+  /** Send a message with inline keyboard buttons. */
   sendWithButtons(
     text: string,
     buttons: Array<{ text: string; data: string }>,
@@ -141,11 +78,8 @@ export class TelegramService {
     });
   }
 
-  /**
-   * Stop the bot gracefully.
-   */
+  /** Stop the bot gracefully. */
   async stop(): Promise<void> {
-    if (this.batchTimer) clearInterval(this.batchTimer);
     await this.bot.stopPolling();
     logger.info("Telegram bot stopped");
   }
@@ -153,7 +87,6 @@ export class TelegramService {
   // ────────────────────────── Internals ──────────────────────────
 
   private setupHandlers(): void {
-    // Authorize and capture chatId
     this.bot.on("message", (msg: Message) => {
       if (!this.authorize(msg)) return;
       this.chatId = msg.chat.id;
@@ -161,19 +94,16 @@ export class TelegramService {
       const text = msg.text?.trim() ?? "";
       if (!text) return;
 
-      // Route commands
       if (text.startsWith("/")) {
         const [cmd, ...rest] = text.split(" ");
-        const command = cmd.slice(1).toLowerCase(); // strip leading /
+        const command = cmd.slice(1).toLowerCase();
         this.onCommandHandler?.(command, rest.join(" "));
         return;
       }
 
-      // Route text input
       this.onTextHandler?.(text);
     });
 
-    // Inline button callbacks
     this.bot.on("callback_query", (query: CallbackQuery) => {
       if (!query.message || !this.authorizeCallback(query)) return;
       this.chatId = query.message.chat.id;
@@ -181,14 +111,13 @@ export class TelegramService {
       const action = query.data ?? "";
       this.onCallbackHandler?.(action, query.id);
 
-      // Acknowledge the button press
       this.bot.answerCallbackQuery(query.id).catch(() => {});
     });
   }
 
   private authorize(msg: Message): boolean {
     if (msg.from?.id !== this.config.authorizedUserId) {
-      logger.warn({ userId: msg.from?.id }, "Unauthorized message — ignored");
+      logger.warn({ userId: msg.from?.id }, "Unauthorized message");
       return false;
     }
     return true;
@@ -196,7 +125,7 @@ export class TelegramService {
 
   private authorizeCallback(query: CallbackQuery): boolean {
     if (query.from.id !== this.config.authorizedUserId) {
-      logger.warn({ userId: query.from.id }, "Unauthorized callback — ignored");
+      logger.warn({ userId: query.from.id }, "Unauthorized callback");
       return false;
     }
     return true;
@@ -223,57 +152,21 @@ export class TelegramService {
         await fn();
         this.lastSendTime = Date.now();
       } catch (err: any) {
-        // Telegram 429 — back off
         if (err?.response?.statusCode === 429) {
           const retryAfter =
             (err.response?.body?.parameters?.retry_after ?? 5) * 1000;
-          logger.warn({ retryAfter }, "Telegram rate limit hit, backing off");
+          logger.warn({ retryAfter }, "Telegram rate limit, backing off");
           await sleep(retryAfter);
-          this.sendQueue.unshift(fn); // re-queue
+          this.sendQueue.unshift(fn);
         } else {
-          logger.error(
-            { err: err?.message },
-            "Failed to send Telegram message",
-          );
+          logger.error({ err: err?.message }, "Failed to send Telegram msg");
         }
       }
     }
     this.processingQueue = false;
   }
 
-  // ── Batch timer ──
-
-  private startBatchTimer(): void {
-    if (this.config.outputMode !== "batched") return;
-
-    this.batchTimer = setInterval(() => {
-      this.flushBuffer();
-    }, this.config.batchIntervalMs);
-  }
-
-  private flushBuffer(): void {
-    if (!this.outputBuffer.trim()) return;
-
-    const text = this.outputBuffer;
-    this.outputBuffer = "";
-    this.enqueueSend(() => this.sendCodeBlock(text));
-  }
-
   // ── Message helpers ──
-
-  private async sendCodeBlock(text: string): Promise<void> {
-    if (!this.chatId) return;
-
-    // Split into chunks that fit Telegram's limit (minus markdown overhead)
-    const maxPayload = TG_MAX_LENGTH - 20; // leave room for ``` wrapper
-    const chunks = splitString(text, maxPayload);
-
-    for (const chunk of chunks) {
-      await this.bot.sendMessage(this.chatId, `\`\`\`\n${chunk}\n\`\`\``, {
-        parse_mode: "Markdown",
-      });
-    }
-  }
 
   private async rawSend(text: string): Promise<void> {
     if (!this.chatId) return;
@@ -282,10 +175,6 @@ export class TelegramService {
     for (const chunk of chunks) {
       await this.bot.sendMessage(this.chatId, chunk);
     }
-  }
-
-  private escapeMarkdown(text: string): string {
-    return text.replace(/([_*\[\]()~`>#+\-=|{}.!\\])/g, "\\$1");
   }
 }
 
@@ -303,7 +192,6 @@ function splitString(str: string, maxLen: number): string[] {
       result.push(remaining);
       break;
     }
-    // Try to split at newline
     let idx = remaining.lastIndexOf("\n", maxLen);
     if (idx === -1 || idx < maxLen / 2) idx = maxLen;
     result.push(remaining.slice(0, idx));

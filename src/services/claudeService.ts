@@ -1,168 +1,196 @@
 import { EventEmitter } from "events";
-import * as pty from "node-pty";
+import { spawn, type ChildProcess } from "child_process";
 import logger from "../utils/logger.js";
 import { getConfig } from "../utils/config.js";
-import {
-  detectPrompt,
-  stripAnsi,
-  type DetectedPrompt,
-} from "../core/promptDetector.js";
 
-export interface ClaudeServiceEvents {
-  output: (data: string) => void;
-  prompt: (prompt: DetectedPrompt) => void;
-  exit: (code: number | undefined, signal: number | undefined) => void;
-  error: (err: Error) => void;
-}
-
+/**
+ * ClaudeService — uses `claude -p --output-format stream-json` per message.
+ * Each user message spawns a short-lived process; conversation state is
+ * maintained via --resume <sessionId>.
+ *
+ * Events emitted:
+ *   text(chunk: string)          — streamed assistant text
+ *   tool_use(info)               — tool invocation
+ *   tool_result(info)            — tool execution result
+ *   result(info)                 — final result with cost/session
+ *   done(code: number)           — process exited
+ *   error(err: Error)            — spawn or runtime error
+ */
 export class ClaudeService extends EventEmitter {
-  private process: pty.IPty | null = null;
+  private process: ChildProcess | null = null;
   private _running = false;
-  private outputLog: string[] = [];
-  private lastInput = "";
-  private suppressEchoUntil = 0;
-
-  /** Max lines kept in memory for /logs */
-  private readonly MAX_LOG_LINES = 2000;
+  private _busy = false;
+  private sessionId: string | null = null;
+  private lineBuffer = "";
 
   get running(): boolean {
     return this._running;
   }
 
-  /**
-   * Spawn Claude CLI via PTY.
-   * @param args  Extra CLI args passed after the claude command
-   */
-  spawn(args: string[] = []): void {
-    if (this._running) {
-      throw new Error("Claude is already running. Stop first.");
+  get busy(): boolean {
+    return this._busy;
+  }
+
+  /** Mark the service as ready (no persistent process needed). */
+  start(): void {
+    this._running = true;
+    this.sessionId = null;
+    logger.info("Claude service ready (stream-json mode)");
+  }
+
+  /** End the current session. */
+  stop(): void {
+    if (this.process) {
+      this.process.kill();
+      this.process = null;
+    }
+    this._running = false;
+    this._busy = false;
+    this.sessionId = null;
+    logger.info("Claude service stopped");
+  }
+
+  /** Start a fresh conversation (clear session, keep service running). */
+  newConversation(): void {
+    if (this.process) {
+      this.process.kill();
+      this.process = null;
+    }
+    this._busy = false;
+    this.sessionId = null;
+    logger.info("New conversation started");
+  }
+
+  /** Send a message to Claude. Spawns a process, streams JSON back. */
+  sendMessage(text: string): void {
+    if (!this._running) {
+      this.emit("error", new Error("Service not started. Use /start."));
+      return;
+    }
+    if (this._busy) {
+      this.emit(
+        "error",
+        new Error("Still processing. Wait or use /interrupt."),
+      );
+      return;
     }
 
     const config = getConfig();
-    const cmd = config.claudeCommand;
+    const args = ["-p", text, "--output-format", "stream-json"];
 
-    logger.info({ cmd, args }, "Spawning Claude CLI");
+    if (this.sessionId) {
+      args.push("--resume", this.sessionId);
+    }
 
-    this.process = pty.spawn(cmd, args, {
-      name: "xterm-256color",
-      cols: 120,
-      rows: 40,
+    this._busy = true;
+    this.lineBuffer = "";
+
+    logger.info({ sessionId: this.sessionId ?? "new" }, "Sending to Claude");
+
+    // Strip CLAUDECODE env var to prevent nesting detection
+    const env = { ...process.env } as Record<string, string>;
+    delete env.CLAUDECODE;
+
+    logger.info({ cmd: config.claudeCommand, args }, "Spawning claude -p");
+
+    this.process = spawn(config.claudeCommand, args, {
       cwd: process.cwd(),
-      env: { ...process.env } as Record<string, string>,
+      env,
+      stdio: ["pipe", "pipe", "pipe"],
     });
 
-    this._running = true;
-    this.outputLog = [];
+    this.process.stdout!.on("data", (chunk: Buffer) => {
+      const str = chunk.toString();
+      logger.debug({ bytes: str.length }, "stdout chunk");
+      this.lineBuffer += str;
+      this.processLines();
+    });
 
-    this.process.onData((data: string) => {
-      // Suppress PTY echo of user input
-      if (this.suppressEchoUntil > Date.now()) {
-        const cleaned = stripAnsi(data).trim();
-        if (cleaned === this.lastInput.trim() || cleaned.length === 0) {
-          return; // Skip echoed input
-        }
-      }
-
-      // Also log to local console for debugging
-      process.stdout.write(data);
-
-      // Store cleaned output for /logs
-      const lines = data.split("\n");
-      for (const line of lines) {
-        if (line.trim()) {
-          this.outputLog.push(stripAnsi(line));
-          if (this.outputLog.length > this.MAX_LOG_LINES) {
-            this.outputLog.shift();
-          }
-        }
-      }
-
-      // Emit raw output
-      this.emit("output", data);
-
-      // Check for prompts
-      const prompt = detectPrompt(data);
-      if (prompt) {
-        this.emit("prompt", prompt);
+    this.process.stderr!.on("data", (chunk: Buffer) => {
+      const msg = chunk.toString().trim();
+      if (msg) {
+        logger.warn({ stderr: msg }, "Claude stderr");
+        // Surface stderr errors to Telegram so user can see them
+        this.emit("error", new Error(msg));
       }
     });
 
-    this.process.onExit(({ exitCode, signal }) => {
-      logger.info({ exitCode, signal }, "Claude process exited");
-      this._running = false;
+    this.process.on("close", (code) => {
+      logger.info({ code, bufferLeft: this.lineBuffer.length }, "Claude process closed");
+      this.processLines(); // flush remaining
+      this._busy = false;
       this.process = null;
-      this.emit("exit", exitCode, signal);
+      this.emit("done", code);
+    });
+
+    this.process.on("error", (err) => {
+      logger.error({ err: err.message }, "Failed to spawn claude");
+      this._busy = false;
+      this.process = null;
+      this.emit("error", err);
     });
   }
 
-  /**
-   * Write raw input to Claude's stdin.
-   */
-  write(input: string): void {
-    if (!this.process || !this._running) {
-      throw new Error("Claude is not running.");
-    }
-    logger.debug({ input: input.trim() }, "Writing to Claude stdin");
-    this.process.write(input);
-  }
-
-  /**
-   * Send a line of text (appends newline).
-   */
-  sendLine(text: string): void {
-    this.lastInput = text;
-    this.suppressEchoUntil = Date.now() + 500; // suppress echo for 500ms
-    this.write(text + "\n");
-  }
-
-  /**
-   * Approve a prompt (send "y\n").
-   */
-  approve(): void {
-    this.sendLine("y");
-  }
-
-  /**
-   * Deny a prompt (send "n\n").
-   */
-  deny(): void {
-    this.sendLine("n");
-  }
-
-  /**
-   * Kill the Claude process.
-   */
-  stop(): void {
-    if (this.process && this._running) {
-      logger.info("Killing Claude process");
-      this.process.kill();
-      this._running = false;
-      this.process = null;
-    }
-  }
-
-  /**
-   * Return the last `n` lines of output.
-   */
-  getLastLines(n = 50): string[] {
-    return this.outputLog.slice(-n);
-  }
-
-  /**
-   * Send SIGINT (Ctrl+C).
-   */
+  /** Interrupt current processing (SIGINT). */
   interrupt(): void {
-    if (this.process && this._running) {
-      this.process.write("\x03");
+    if (this.process) {
+      this.process.kill("SIGINT");
+      this._busy = false;
+      this.process = null;
     }
   }
 
-  /**
-   * Resize the PTY.
-   */
-  resize(cols: number, rows: number): void {
-    if (this.process && this._running) {
-      this.process.resize(cols, rows);
+  // ── JSON line parsing ──
+
+  private processLines(): void {
+    const parts = this.lineBuffer.split("\n");
+    this.lineBuffer = parts.pop() ?? "";
+
+    for (const line of parts) {
+      const trimmed = line.trim();
+      if (!trimmed) continue;
+      try {
+        this.handleEvent(JSON.parse(trimmed));
+      } catch {
+        logger.debug({ line: trimmed.slice(0, 200) }, "Non-JSON line");
+      }
+    }
+  }
+
+  private handleEvent(ev: any): void {
+    logger.debug({ type: ev.type, subtype: ev.subtype }, "JSON event");
+    switch (ev.type) {
+      case "system":
+        if (ev.session_id) this.sessionId = ev.session_id;
+        break;
+
+      case "assistant":
+        if (ev.subtype === "text") {
+          this.emit("text", ev.text ?? "");
+        } else if (ev.subtype === "tool_use") {
+          this.emit("tool_use", {
+            tool: ev.name ?? "unknown",
+            input: ev.input ?? {},
+          });
+        }
+        break;
+
+      case "tool_result":
+        this.emit("tool_result", {
+          tool: ev.name ?? "unknown",
+          content: ev.content ?? "",
+        });
+        break;
+
+      case "result":
+        if (ev.session_id) this.sessionId = ev.session_id;
+        this.emit("result", {
+          text: ev.text ?? "",
+          costUsd: ev.cost_usd ?? 0,
+          sessionId: ev.session_id ?? this.sessionId,
+          durationMs: ev.duration_ms ?? 0,
+        });
+        break;
     }
   }
 }
